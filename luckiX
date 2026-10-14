@@ -1,36 +1,35 @@
 """
-RunTimeBroker Win7 Edition
-- No admin rights needed (uses pynput instead of keyboard)
-- Packages install to USB, nothing left on machine
-- API keys baked in, no config needed
-- Hotkeys: Ctrl+Shift+A, Alt+J, Alt+K, Alt+M (cycle model)
-- Answer appears at cursor, closes in 3.5s or on click
+RunTimeBroker Win7 Edition (fixed)
+
+- No admin rights needed (hotkeys via the Win32 RegisterHotKey API, no extra package)
+- Hotkeys: Ctrl+Shift+A / Alt+J = ask, Alt+K = repeat last answer, Alt+M = next model
+- Answer appears at the cursor, closes after a few seconds or on click
 - Tray icon with model switcher and exit
-- Anti-freeze: every fetch runs isolated, bot stays responsive always
+- API keys are read from keys.json (next to this file) or environment variables
+- Every fetch runs in its own thread; a newer request cancels an older one
+
+keys.json format:
+    {"groq": "...", "gemini": "...", "openrouter": "...", "mistral": "..."}
 """
 
 import sys
 import os
-import threading
+import json
+import time
+import queue
 import ctypes
+import threading
 import tkinter as tk
-
-# ── Make sure packages load from USB (set by START_BOT.bat) ──────────────────
-# sys.path is already patched by the bat file before launch
+from ctypes import wintypes
 
 try:
     import pyperclip
     import requests
     HAS_DEPS = True
+    _missing = ""
 except ImportError as e:
     HAS_DEPS = False
     _missing = str(e)
-
-try:
-    from pynput import keyboard as pynkb
-    HAS_KB = True
-except ImportError:
-    HAS_KB = False
 
 try:
     import pystray
@@ -39,37 +38,60 @@ try:
 except ImportError:
     HAS_TRAY = False
 
-# ── API Keys (already set, no config needed) ──────────────────────────────────
-GROQ_API_KEY       = "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"
-GEMINI_API_KEY     = "AQ.Ab8RN6JxOXtLXDLEuIegy4kSByeJDdDaXtY8EMRFXUtrfwD45A"
-OPENROUTER_API_KEY = "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"
-MISTRAL_API_KEY    = "DvN7fFCSMUCTlVHTKYpLMgRKCmWw5ueu"
+# ── API keys ──────────────────────────────────────────────────────────────────
+def _load_keys():
+    keys = {"groq": "", "gemini": "", "openrouter": "", "mistral": ""}
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in keys:
+            keys[k] = str(data.get(k, "")).strip()
+    except Exception:
+        pass
+    for k in keys:
+        env = os.environ.get(k.upper() + "_API_KEY", "").strip()
+        if env:
+            keys[k] = env
+    return keys
 
-# ── Model switcher ────────────────────────────────────────────────────────────
-# Each entry: (display_name, provider_key, model_id)
+KEYS = _load_keys()
+
+# ── Models: (display name, provider, model id) ────────────────────────────────
+# Providers retire models often. Dead models are skipped automatically, but if
+# everything fails, check each provider's current model list and edit this.
 MODELS = [
-    ("Groq  – Llama3 8B",      "groq",       "llama3-8b-8192"),
-    ("Groq  – Llama3 70B",     "groq",       "llama3-70b-8192"),
-    ("Groq  – Mixtral 8x7B",   "groq",       "mixtral-8x7b-32768"),
-    ("Gemini – 1.5 Flash",     "gemini",     "gemini-1.5-flash"),
-    ("Gemini – 1.5 Pro",       "gemini",     "gemini-1.5-pro"),
-    ("OpenRouter – Mistral 7B","openrouter", "mistralai/mistral-7b-instruct"),
-    ("OpenRouter – Llama3 8B", "openrouter", "meta-llama/llama-3-8b-instruct:free"),
-    ("Mistral – Small",        "mistral",    "mistral-small-latest"),
-    ("Mistral – Medium",       "mistral",    "mistral-medium-latest"),
+    ("Groq - GPT-OSS 20B",        "groq",       "openai/gpt-oss-20b"),
+    ("Groq - GPT-OSS 120B",       "groq",       "openai/gpt-oss-120b"),
+    ("Groq - Llama 3.3 70B",      "groq",       "llama-3.3-70b-versatile"),
+    ("Groq - Llama 3.1 8B",       "groq",       "llama-3.1-8b-instant"),
+    ("Gemini - 3.8 Flash",        "gemini",     "gemini-3.8-flash"),
+    ("Gemini - 3.5 Flash-Lite",   "gemini",     "gemini-3.5-flash-lite"),
+    ("Gemini - 3.1 Pro",          "gemini",     "gemini-3.1-pro-preview"),
+    ("Gemini - 4 Argon",          "gemini",     "gemini-4-argon"),
+    ("Mistral - Small 4",         "mistral",    "mistral-small-2603"),
+    ("Mistral - Medium 3.5",      "mistral",    "mistral-medium-3-5"),
+    ("Mistral - Large 4",         "mistral",    "mistral-large-4"),
+    ("OpenRouter - Nemotron 3 Super", "openrouter",
+     "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("OpenRouter - Laguna S 2.1", "openrouter", "poolside/laguna-s-2.1:free"),
+    ("OpenRouter - Nemotron 3 Ultra", "openrouter",
+     "nvidia/nemotron-3-ultra-550b-a55b:free"),
 ]
-_model_index = 0   # currently active model
+_model_index = 0
+
+OPENAI_STYLE = {
+    "groq":       "https://api.groq.com/openai/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "mistral":    "https://api.mistral.ai/v1/chat/completions",
+}
+SYSTEM_PROMPT = "Answer concisely and directly."
+MAX_TOKENS    = 1024     # reasoning models spend tokens thinking, so keep this generous
+REQ_TIMEOUT   = 12       # seconds per provider call
+TOTAL_BUDGET  = 35       # seconds across all fallbacks
 
 def current_model():
     return MODELS[_model_index]
-
-def cycle_model():
-    global _model_index
-    _model_index = (_model_index + 1) % len(MODELS)
-    name, _, _ = current_model()
-    cx, cy = cursor_pos()
-    _show("Model: " + name, "", cx, cy)
-    _refresh_tray()
 
 # ── Overlay config ────────────────────────────────────────────────────────────
 OV_BG       = "#F6F6F6"
@@ -79,179 +101,235 @@ OV_FONT     = "Segoe UI"
 OV_SIZE     = 11
 OV_WRAP     = 460
 OV_PAD      = 10
-OV_CLOSE_MS = 3500
+OV_CLOSE_MS = 3500        # minimum display time
+OV_MS_PER_CHAR = 25       # extra time per character so long answers stay readable (0 = off)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _last_answer   = ""
 _last_provider = ""
-_ov_win        = None
-_ov_lock       = threading.Lock()
-_fetching      = False          # anti-freeze: track active fetch
-_tray_icon     = None           # ref for tray refresh
+_req_lock      = threading.Lock()
+_req_id        = 0
+_dead_models   = set()
+_dead_provs    = set()
+_tray_icon     = None
+
+_ui_q  = queue.Queue()
+_root  = None
+_ov    = None
+_ov_after = None
+
+def _new_req():
+    global _req_id
+    with _req_lock:
+        _req_id += 1
+        return _req_id
+
+def _is_current(rid):
+    return rid == _req_id
 
 # ── Cursor position ───────────────────────────────────────────────────────────
+class _PT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
 def cursor_pos():
-    class PT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-    pt = PT()
+    pt = _PT()
     ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
 
 # ── AI providers ──────────────────────────────────────────────────────────────
+class ProviderError(Exception):
+    def __init__(self, msg, model_dead=False, provider_dead=False):
+        Exception.__init__(self, msg)
+        self.model_dead = model_dead
+        self.provider_dead = provider_dead
+
+_DEAD_WORDS = ("decommission", "not found", "does not exist", "no longer",
+               "deprecated", "invalid model", "unknown model", "not supported")
+
+def _post(url, headers, body):
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=REQ_TIMEOUT)
+    except requests.RequestException as e:
+        # str(e) can contain the URL; never contains keys now (keys are in headers)
+        raise ProviderError("network: " + e.__class__.__name__)
+    code = r.status_code
+    if code < 400:
+        try:
+            return r.json()
+        except ValueError:
+            raise ProviderError("bad JSON")
+    low = r.text.lower()
+    if code in (401, 403) or "api key" in low or "api_key" in low:
+        raise ProviderError("HTTP %d (key rejected)" % code, provider_dead=True)
+    if code == 404 or (code == 400 and any(w in low for w in _DEAD_WORDS)):
+        raise ProviderError("HTTP %d (model gone)" % code, model_dead=True)
+    raise ProviderError("HTTP %d" % code)
+
 def _call_provider(provider, model_id, q):
-    """Call the right provider with the chosen model_id."""
-    if provider == "groq":
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": "Bearer " + GROQ_API_KEY,
-                     "Content-Type": "application/json"},
-            json={"model": model_id,
-                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
-                               {"role": "user",   "content": q}],
-                  "max_tokens": 400, "temperature": 0.4},
-            timeout=15)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+    key = KEYS.get(provider, "")
+    if not key:
+        raise ProviderError("no key", provider_dead=True)
+
+    if provider in OPENAI_STYLE:
+        body = {"model": model_id,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                             {"role": "user",   "content": q}],
+                "max_tokens": MAX_TOKENS, "temperature": 0.4}
+        if provider == "groq" and model_id.startswith("openai/gpt-oss"):
+            body["reasoning_effort"] = "low"
+            body.pop("temperature", None)
+        data = _post(OPENAI_STYLE[provider],
+                     {"Authorization": "Bearer " + key,
+                      "Content-Type": "application/json"}, body)
+        try:
+            text = data["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            text = ""
 
     elif provider == "gemini":
-        r = requests.post(
+        data = _post(
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            + model_id + ":generateContent?key=" + GEMINI_API_KEY,
-            json={"contents": [{"parts": [{"text": q}]}],
-                  "generationConfig": {"maxOutputTokens": 400, "temperature": 0.4}},
-            timeout=15)
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            + model_id + ":generateContent",
+            {"x-goog-api-key": key, "Content-Type": "application/json"},
+            {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+             "contents": [{"parts": [{"text": q}]}],
+             "generationConfig": {"maxOutputTokens": MAX_TOKENS, "temperature": 0.4}})
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        except (KeyError, IndexError, TypeError):
+            text = ""
+    else:
+        raise ProviderError("unknown provider", model_dead=True)
 
-    elif provider == "openrouter":
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY,
-                     "Content-Type": "application/json"},
-            json={"model": model_id,
-                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
-                               {"role": "user",   "content": q}],
-                  "max_tokens": 400},
-            timeout=15)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-    elif provider == "mistral":
-        r = requests.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={"Authorization": "Bearer " + MISTRAL_API_KEY,
-                     "Content-Type": "application/json"},
-            json={"model": model_id,
-                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
-                               {"role": "user",   "content": q}],
-                  "max_tokens": 400, "temperature": 0.4},
-            timeout=15)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-    raise ValueError("Unknown provider: " + provider)
+    text = text.strip()
+    if not text:
+        raise ProviderError("empty answer")
+    return text
 
 
-def get_answer(q):
-    """Try active model first, then fall back through all others."""
+def get_answer(q, rid):
+    """Active model first, then the rest. Returns (text, name) or None if superseded."""
     global _last_answer, _last_provider
+    deadline = time.time() + TOTAL_BUDGET
+    order = [_model_index] + [i for i in range(len(MODELS)) if i != _model_index]
+    tried = 0
 
-    display, provider, model_id = current_model()
-
-    # Build ordered list: active model first, then rest as fallback
-    ordered = [(display, provider, model_id)]
-    for i, m in enumerate(MODELS):
-        if i != _model_index:
-            ordered.append(m)
-
-    for disp, prov, mid in ordered:
+    for i in order:
+        if not _is_current(rid):
+            return None
+        if time.time() > deadline:
+            break
+        name, prov, mid = MODELS[i]
+        if i in _dead_models or prov in _dead_provs:
+            continue
+        tried += 1
         try:
             a = _call_provider(prov, mid, q)
-            if a:
-                _last_answer  = a
-                _last_provider = disp
-                return a, disp
+        except ProviderError as e:
+            print("[{}] {}".format(name, e))
+            if e.provider_dead:
+                _dead_provs.add(prov)
+            elif e.model_dead:
+                _dead_models.add(i)
+            continue
         except Exception as e:
-            print("[{}] {}".format(disp, e))
+            print("[{}] {}".format(name, e.__class__.__name__))
+            continue
+        if not _is_current(rid):
+            return None
+        _last_answer, _last_provider = a, name
+        return a, name
 
-    return "All providers failed. Check internet connection.", "None"
+    if not _is_current(rid):
+        return None
+    if tried == 0:
+        return ("No usable model. Check keys.json (missing or rejected keys) "
+                "or update the MODELS list.", "")
+    return "All providers failed. Check internet connection.", ""
 
-# ── Overlay ───────────────────────────────────────────────────────────────────
-def _kill_overlay():
-    global _ov_win
-    with _ov_lock:
+# ── Overlay (all Tk calls happen on the main thread via _ui_q) ────────────────
+def _show(text, provider="", cx=None, cy=None, ms=None):
+    if cx is None:
+        cx, cy = cursor_pos()
+    if ms is None:
+        ms = OV_CLOSE_MS + OV_MS_PER_CHAR * len(text)
+    _ui_q.put(("show", text, provider, cx, cy, ms))
+
+def _destroy_overlay():
+    global _ov, _ov_after
+    if _ov_after is not None:
         try:
-            if _ov_win:
-                _ov_win.quit()
-                _ov_win.destroy()
+            _root.after_cancel(_ov_after)
         except Exception:
             pass
-        _ov_win = None
-
-def _show(text, provider="", cx=None, cy=None):
-    global _ov_win
-    _kill_overlay()
-
-    def run():
-        global _ov_win
-        win = tk.Tk()
-        win.withdraw()
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
+        _ov_after = None
+    if _ov is not None:
         try:
-            win.attributes("-alpha", 0.95)
+            _ov.destroy()
         except Exception:
             pass
-        win.configure(bg=OV_BORDER)
+        _ov = None
 
-        f = tk.Frame(win, bg=OV_BG, padx=OV_PAD, pady=OV_PAD - 2)
-        f.pack(padx=1, pady=1)
+def _render(text, provider, cx, cy, ms):
+    global _ov, _ov_after
+    _destroy_overlay()
 
-        if provider and provider not in ("None", ""):
-            tk.Label(f, text=provider, font=(OV_FONT, 8),
-                     bg=OV_BG, fg="#BBBBBB", anchor="w").pack(fill="x")
+    win = tk.Toplevel(_root)
+    win.withdraw()
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    try:
+        win.attributes("-alpha", 0.95)
+    except Exception:
+        pass
+    win.configure(bg=OV_BORDER)
 
-        tk.Label(f, text=text, font=(OV_FONT, OV_SIZE),
-                 bg=OV_BG, fg=OV_FG,
-                 wraplength=OV_WRAP, justify="left",
-                 anchor="w").pack(fill="x", pady=(2, 0))
+    f = tk.Frame(win, bg=OV_BG, padx=OV_PAD, pady=OV_PAD - 2)
+    f.pack(padx=1, pady=1)
 
-        win.update_idletasks()
-        w = win.winfo_reqwidth()
-        h = win.winfo_reqheight()
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
+    if provider:
+        tk.Label(f, text=provider, font=(OV_FONT, 8),
+                 bg=OV_BG, fg="#BBBBBB", anchor="w").pack(fill="x")
+    tk.Label(f, text=text, font=(OV_FONT, OV_SIZE), bg=OV_BG, fg=OV_FG,
+             wraplength=OV_WRAP, justify="left", anchor="w").pack(fill="x", pady=(2, 0))
 
-        mx, my = (cx, cy) if cx is not None else cursor_pos()
-        x = mx + 14
-        y = my + 14
-        if x + w > sw: x = mx - w - 10
-        if y + h > sh: y = my - h - 10
-        if x < 0: x = 4
-        if y < 0: y = 4
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    x, y = cx + 14, cy + 14
+    if x + w > sw: x = cx - w - 10
+    if y + h > sh: y = cy - h - 10
+    if x < 0: x = 4
+    if y < 0: y = 4
+    win.geometry("{}x{}+{}+{}".format(w, h, x, y))
+    win.deiconify()
 
-        win.geometry("{}x{}+{}+{}".format(w, h, x, y))
-        win.deiconify()
-        _ov_win = win
+    def bind_all(widget):
+        for ev in ("<Button-1>", "<Button-2>", "<Button-3>"):
+            widget.bind(ev, lambda e: _destroy_overlay())
+        for c in widget.winfo_children():
+            bind_all(c)
+    bind_all(win)
 
-        def close(e=None):
-            _kill_overlay()
+    _ov = win
+    _ov_after = _root.after(ms, _destroy_overlay)
 
-        win.bind("<Button-1>", close)
-        win.bind("<Button-2>", close)
-        win.bind("<Button-3>", close)
-        win.bind("<Escape>",   close)
-        for c in f.winfo_children():
-            c.bind("<Button-1>", close)
+def _pump():
+    try:
+        while True:
+            item = _ui_q.get_nowait()
+            if item[0] == "show":
+                try:
+                    _render(*item[1:])
+                except Exception as e:
+                    print("overlay error:", e)
+    except queue.Empty:
+        pass
+    _root.after(40, _pump)
 
-        win.after(OV_CLOSE_MS, _kill_overlay)
-        win.mainloop()
-
-    threading.Thread(target=run, daemon=True).start()
-
-# ── Hotkey actions ────────────────────────────────────────────────────────────
+# ── Actions ───────────────────────────────────────────────────────────────────
 def do_ask():
-    global _fetching
     cx, cy = cursor_pos()
     try:
         q = pyperclip.paste().strip()
@@ -261,129 +339,106 @@ def do_ask():
         _show("Nothing in clipboard.\nCopy a question first.", "", cx, cy)
         return
 
-    # Anti-freeze: if already fetching, cancel old one and start fresh
-    _fetching = False  # signal old fetch to discard its result
-    _fetching = True
-
-    _show("thinking...", "", cx, cy)
-
-    fetch_id = id(q) ^ id(threading.current_thread())  # unique per call
+    rid = _new_req()                      # invalidates any fetch still running
+    _show("thinking...", "", cx, cy, ms=TOTAL_BUDGET * 1000)
 
     def fetch():
-        global _fetching
         try:
-            ans, prov = get_answer(q[:2000])
+            res = get_answer(q[:2000], rid)
         except Exception as e:
-            ans, prov = "Error: " + str(e), ""
-        # Only show if this is still the latest fetch
-        if _fetching:
-            _fetching = False
-            _show(ans, prov, cx, cy)
+            res = ("Error: " + e.__class__.__name__, "")
+        if res is not None and _is_current(rid):
+            _show(res[0], res[1], cx, cy)
 
     threading.Thread(target=fetch, daemon=True).start()
 
 def do_repeat():
+    _new_req()                            # cancel a pending fetch
     cx, cy = cursor_pos()
     if _last_answer:
         _show(_last_answer, _last_provider, cx, cy)
     else:
         _show("No previous answer yet.", "", cx, cy)
 
-# ── Hotkeys via pynput (no admin needed) ──────────────────────────────────────
+def set_model(i):
+    global _model_index
+    _model_index = i
+    cx, cy = cursor_pos()
+    _show("Model: " + current_model()[0], "", cx, cy)
+    _refresh_tray()
+
+def cycle_model():
+    set_model((_model_index + 1) % len(MODELS))
+
+# ── Hotkeys: Win32 RegisterHotKey (no admin, no extra package) ────────────────
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
+WM_HOTKEY = 0x0312
+
+HOTKEYS = {
+    1: ("Ctrl+Shift+A", MOD_CONTROL | MOD_SHIFT, ord("A"), do_ask),
+    2: ("Alt+J",        MOD_ALT,                 ord("J"), do_ask),
+    3: ("Alt+K",        MOD_ALT,                 ord("K"), do_repeat),
+    4: ("Alt+M",        MOD_ALT,                 ord("M"), cycle_model),
+}
+
+def _hotkey_loop():
+    user32 = ctypes.windll.user32
+    failed = []
+    for hid, (label, mod, vk, _) in HOTKEYS.items():
+        if not user32.RegisterHotKey(None, hid, mod | MOD_NOREPEAT, vk):
+            failed.append(label)
+    if failed:
+        _show("Hotkey already used by another program:\n" + ", ".join(failed),
+              "", 20, 20, ms=6000)
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        if msg.message == WM_HOTKEY and msg.wParam in HOTKEYS:
+            threading.Thread(target=HOTKEYS[msg.wParam][3], daemon=True).start()
+
 def start_hotkeys():
-    if not HAS_KB:
-        print("WARNING: pynput not found, hotkeys disabled.")
-        return
-
-    COMBO_ASK    = {pynkb.Key.ctrl, pynkb.Key.shift, pynkb.KeyCode(char='a')}
-    COMBO_ASK_J  = {pynkb.Key.alt,  pynkb.KeyCode(char='j')}
-    COMBO_REPEAT = {pynkb.Key.alt,  pynkb.KeyCode(char='k')}
-
-    current = set()
-
-    def on_press(key):
-        try:
-            current.add(key)
-        except Exception:
-            pass
-
-        # Normalize: check char versions too
-        pressed = set()
-        for k in current:
-            pressed.add(k)
-            if hasattr(k, 'char') and k.char:
-                pressed.add(pynkb.KeyCode(char=k.char.lower()))
-
-        if (pynkb.Key.ctrl in pressed and
-            pynkb.Key.shift in pressed and
-            pynkb.KeyCode(char='a') in pressed):
-            threading.Thread(target=do_ask, daemon=True).start()
-
-        if (pynkb.Key.alt in pressed and
-            pynkb.KeyCode(char='j') in pressed):
-            threading.Thread(target=do_ask, daemon=True).start()
-
-        if (pynkb.Key.alt in pressed and
-            pynkb.KeyCode(char='k') in pressed):
-            threading.Thread(target=do_repeat, daemon=True).start()
-
-        if (pynkb.Key.alt in pressed and
-            pynkb.KeyCode(char='m') in pressed):
-            threading.Thread(target=cycle_model, daemon=True).start()
-
-    def on_release(key):
-        try:
-            current.discard(key)
-        except Exception:
-            pass
-
-    listener = pynkb.Listener(on_press=on_press, on_release=on_release)
-    listener.daemon = True
-    listener.start()
-    return listener
+    threading.Thread(target=_hotkey_loop, daemon=True).start()
 
 # ── Tray ──────────────────────────────────────────────────────────────────────
 def _make_tray_img():
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([2, 2, 62, 62], radius=10, fill=(240, 240, 240))
-    d.rounded_rectangle([2, 2, 62, 62], radius=10, outline=(180, 180, 180), width=2)
-    d.text((10, 18), "RTB", fill=(60, 60, 60))
+    d.rounded_rectangle([2, 2, 62, 62], radius=10, fill=(240, 240, 240),
+                        outline=(180, 180, 180), width=2)
+    d.text((10, 26), "RTB", fill=(60, 60, 60))
     return img
 
+# pystray inspects argument counts, so these are factories, not default-arg lambdas
+def _mk_label(i):
+    return lambda item: MODELS[i][0]
+
+def _mk_checked(i):
+    return lambda item: _model_index == i
+
+def _mk_action(i):
+    return lambda icon, item: set_model(i)
+
 def _build_tray_menu():
-    def on_exit(icon, _):
+    items = [pystray.MenuItem(_mk_label(i), _mk_action(i),
+                              checked=_mk_checked(i), radio=True)
+             for i in range(len(MODELS))]
+
+    def on_exit(icon, item):
         icon.stop()
         os._exit(0)
-
-    def make_model_setter(i):
-        def setter(icon, item):
-            global _model_index
-            _model_index = i
-            name, _, _ = current_model()
-            cx, cy = cursor_pos()
-            _show("Model: " + name, "", cx, cy)
-        return setter
-
-    model_items = []
-    for i, (name, _, _) in enumerate(MODELS):
-        label = ("✓ " if i == _model_index else "   ") + name
-        model_items.append(pystray.MenuItem(label, make_model_setter(i)))
 
     return pystray.Menu(
         pystray.MenuItem("RunTimeBroker", None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Switch Model", pystray.Menu(*model_items)),
-        pystray.MenuItem("Next Model  (Alt+M)", lambda icon, _: cycle_model()),
+        pystray.MenuItem("Switch Model", pystray.Menu(*items)),
+        pystray.MenuItem("Next Model  (Alt+M)", lambda icon, item: cycle_model()),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit", on_exit)
+        pystray.MenuItem("Exit", on_exit),
     )
 
 def _refresh_tray():
-    global _tray_icon
     try:
         if _tray_icon:
-            _tray_icon.menu = _build_tray_menu()
+            _tray_icon.update_menu()
     except Exception:
         pass
 
@@ -391,46 +446,37 @@ def start_tray():
     global _tray_icon
     if not HAS_TRAY:
         return
-
-    icon = pystray.Icon(
-        "RunTimeBroker",
-        _make_tray_img(),
-        "RunTimeBroker",
-        menu=_build_tray_menu()
-    )
-    _tray_icon = icon
-    threading.Thread(target=icon.run, daemon=True).start()
+    _tray_icon = pystray.Icon("RunTimeBroker", _make_tray_img(),
+                              "RunTimeBroker", menu=_build_tray_menu())
+    threading.Thread(target=_tray_icon.run, daemon=True).start()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    global _root
     if not HAS_DEPS:
         ctypes.windll.user32.MessageBoxW(
-            0,
-            "Missing packages: " + _missing +
-            "\n\nRun SETUP.bat from the USB drive first.",
-            "RunTimeBroker", 0x10)
+            0, "Missing packages: " + _missing +
+            "\n\nRun SETUP.bat from the USB drive first.", "RunTimeBroker", 0x10)
         sys.exit(1)
 
-    listener = start_hotkeys()
+    _root = tk.Tk()
+    _root.withdraw()
+    _root.after(40, _pump)
+
+    start_hotkeys()
     start_tray()
 
+    missing = [p for p, k in KEYS.items() if not k]
     print("RunTimeBroker running.")
-    print("Ctrl+Shift+A / Alt+J = ask  |  Alt+K = repeat  |  Alt+M = switch model")
-    if HAS_TRAY:
-        print("Right-click tray icon to exit.")
-    else:
-        print("Close this window to exit.")
+    print("Ctrl+Shift+A / Alt+J = ask | Alt+K = repeat | Alt+M = switch model")
+    if missing:
+        print("No key for: " + ", ".join(missing) + " (add to keys.json)")
 
-    # Keep alive
     try:
-        if listener:
-            listener.join()
-        else:
-            import time
-            while True:
-                time.sleep(1)
+        _root.mainloop()
     except KeyboardInterrupt:
-        os._exit(0)
+        pass
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
