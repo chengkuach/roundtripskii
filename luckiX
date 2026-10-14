@@ -1,0 +1,436 @@
+"""
+RunTimeBroker Win7 Edition
+- No admin rights needed (uses pynput instead of keyboard)
+- Packages install to USB, nothing left on machine
+- API keys baked in, no config needed
+- Hotkeys: Ctrl+Shift+A, Alt+J, Alt+K, Alt+M (cycle model)
+- Answer appears at cursor, closes in 3.5s or on click
+- Tray icon with model switcher and exit
+- Anti-freeze: every fetch runs isolated, bot stays responsive always
+"""
+
+import sys
+import os
+import threading
+import ctypes
+import tkinter as tk
+
+# ── Make sure packages load from USB (set by START_BOT.bat) ──────────────────
+# sys.path is already patched by the bat file before launch
+
+try:
+    import pyperclip
+    import requests
+    HAS_DEPS = True
+except ImportError as e:
+    HAS_DEPS = False
+    _missing = str(e)
+
+try:
+    from pynput import keyboard as pynkb
+    HAS_KB = True
+except ImportError:
+    HAS_KB = False
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+
+# ── API Keys (already set, no config needed) ──────────────────────────────────
+GROQ_API_KEY       = "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"
+GEMINI_API_KEY     = "AQ.Ab8RN6JxOXtLXDLEuIegy4kSByeJDdDaXtY8EMRFXUtrfwD45A"
+OPENROUTER_API_KEY = "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"
+MISTRAL_API_KEY    = "DvN7fFCSMUCTlVHTKYpLMgRKCmWw5ueu"
+
+# ── Model switcher ────────────────────────────────────────────────────────────
+# Each entry: (display_name, provider_key, model_id)
+MODELS = [
+    ("Groq  – Llama3 8B",      "groq",       "llama3-8b-8192"),
+    ("Groq  – Llama3 70B",     "groq",       "llama3-70b-8192"),
+    ("Groq  – Mixtral 8x7B",   "groq",       "mixtral-8x7b-32768"),
+    ("Gemini – 1.5 Flash",     "gemini",     "gemini-1.5-flash"),
+    ("Gemini – 1.5 Pro",       "gemini",     "gemini-1.5-pro"),
+    ("OpenRouter – Mistral 7B","openrouter", "mistralai/mistral-7b-instruct"),
+    ("OpenRouter – Llama3 8B", "openrouter", "meta-llama/llama-3-8b-instruct:free"),
+    ("Mistral – Small",        "mistral",    "mistral-small-latest"),
+    ("Mistral – Medium",       "mistral",    "mistral-medium-latest"),
+]
+_model_index = 0   # currently active model
+
+def current_model():
+    return MODELS[_model_index]
+
+def cycle_model():
+    global _model_index
+    _model_index = (_model_index + 1) % len(MODELS)
+    name, _, _ = current_model()
+    cx, cy = cursor_pos()
+    _show("Model: " + name, "", cx, cy)
+    _refresh_tray()
+
+# ── Overlay config ────────────────────────────────────────────────────────────
+OV_BG       = "#F6F6F6"
+OV_FG       = "#1A1A1A"
+OV_BORDER   = "#D0D0D0"
+OV_FONT     = "Segoe UI"
+OV_SIZE     = 11
+OV_WRAP     = 460
+OV_PAD      = 10
+OV_CLOSE_MS = 3500
+
+# ── State ─────────────────────────────────────────────────────────────────────
+_last_answer   = ""
+_last_provider = ""
+_ov_win        = None
+_ov_lock       = threading.Lock()
+_fetching      = False          # anti-freeze: track active fetch
+_tray_icon     = None           # ref for tray refresh
+
+# ── Cursor position ───────────────────────────────────────────────────────────
+def cursor_pos():
+    class PT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+    pt = PT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+# ── AI providers ──────────────────────────────────────────────────────────────
+def _call_provider(provider, model_id, q):
+    """Call the right provider with the chosen model_id."""
+    if provider == "groq":
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + GROQ_API_KEY,
+                     "Content-Type": "application/json"},
+            json={"model": model_id,
+                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
+                               {"role": "user",   "content": q}],
+                  "max_tokens": 400, "temperature": 0.4},
+            timeout=15)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+    elif provider == "gemini":
+        r = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            + model_id + ":generateContent?key=" + GEMINI_API_KEY,
+            json={"contents": [{"parts": [{"text": q}]}],
+                  "generationConfig": {"maxOutputTokens": 400, "temperature": 0.4}},
+            timeout=15)
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    elif provider == "openrouter":
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY,
+                     "Content-Type": "application/json"},
+            json={"model": model_id,
+                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
+                               {"role": "user",   "content": q}],
+                  "max_tokens": 400},
+            timeout=15)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+    elif provider == "mistral":
+        r = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + MISTRAL_API_KEY,
+                     "Content-Type": "application/json"},
+            json={"model": model_id,
+                  "messages": [{"role": "system", "content": "Answer concisely and directly."},
+                               {"role": "user",   "content": q}],
+                  "max_tokens": 400, "temperature": 0.4},
+            timeout=15)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+
+    raise ValueError("Unknown provider: " + provider)
+
+
+def get_answer(q):
+    """Try active model first, then fall back through all others."""
+    global _last_answer, _last_provider
+
+    display, provider, model_id = current_model()
+
+    # Build ordered list: active model first, then rest as fallback
+    ordered = [(display, provider, model_id)]
+    for i, m in enumerate(MODELS):
+        if i != _model_index:
+            ordered.append(m)
+
+    for disp, prov, mid in ordered:
+        try:
+            a = _call_provider(prov, mid, q)
+            if a:
+                _last_answer  = a
+                _last_provider = disp
+                return a, disp
+        except Exception as e:
+            print("[{}] {}".format(disp, e))
+
+    return "All providers failed. Check internet connection.", "None"
+
+# ── Overlay ───────────────────────────────────────────────────────────────────
+def _kill_overlay():
+    global _ov_win
+    with _ov_lock:
+        try:
+            if _ov_win:
+                _ov_win.quit()
+                _ov_win.destroy()
+        except Exception:
+            pass
+        _ov_win = None
+
+def _show(text, provider="", cx=None, cy=None):
+    global _ov_win
+    _kill_overlay()
+
+    def run():
+        global _ov_win
+        win = tk.Tk()
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.95)
+        except Exception:
+            pass
+        win.configure(bg=OV_BORDER)
+
+        f = tk.Frame(win, bg=OV_BG, padx=OV_PAD, pady=OV_PAD - 2)
+        f.pack(padx=1, pady=1)
+
+        if provider and provider not in ("None", ""):
+            tk.Label(f, text=provider, font=(OV_FONT, 8),
+                     bg=OV_BG, fg="#BBBBBB", anchor="w").pack(fill="x")
+
+        tk.Label(f, text=text, font=(OV_FONT, OV_SIZE),
+                 bg=OV_BG, fg=OV_FG,
+                 wraplength=OV_WRAP, justify="left",
+                 anchor="w").pack(fill="x", pady=(2, 0))
+
+        win.update_idletasks()
+        w = win.winfo_reqwidth()
+        h = win.winfo_reqheight()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+
+        mx, my = (cx, cy) if cx is not None else cursor_pos()
+        x = mx + 14
+        y = my + 14
+        if x + w > sw: x = mx - w - 10
+        if y + h > sh: y = my - h - 10
+        if x < 0: x = 4
+        if y < 0: y = 4
+
+        win.geometry("{}x{}+{}+{}".format(w, h, x, y))
+        win.deiconify()
+        _ov_win = win
+
+        def close(e=None):
+            _kill_overlay()
+
+        win.bind("<Button-1>", close)
+        win.bind("<Button-2>", close)
+        win.bind("<Button-3>", close)
+        win.bind("<Escape>",   close)
+        for c in f.winfo_children():
+            c.bind("<Button-1>", close)
+
+        win.after(OV_CLOSE_MS, _kill_overlay)
+        win.mainloop()
+
+    threading.Thread(target=run, daemon=True).start()
+
+# ── Hotkey actions ────────────────────────────────────────────────────────────
+def do_ask():
+    global _fetching
+    cx, cy = cursor_pos()
+    try:
+        q = pyperclip.paste().strip()
+    except Exception:
+        q = ""
+    if not q:
+        _show("Nothing in clipboard.\nCopy a question first.", "", cx, cy)
+        return
+
+    # Anti-freeze: if already fetching, cancel old one and start fresh
+    _fetching = False  # signal old fetch to discard its result
+    _fetching = True
+
+    _show("thinking...", "", cx, cy)
+
+    fetch_id = id(q) ^ id(threading.current_thread())  # unique per call
+
+    def fetch():
+        global _fetching
+        try:
+            ans, prov = get_answer(q[:2000])
+        except Exception as e:
+            ans, prov = "Error: " + str(e), ""
+        # Only show if this is still the latest fetch
+        if _fetching:
+            _fetching = False
+            _show(ans, prov, cx, cy)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+def do_repeat():
+    cx, cy = cursor_pos()
+    if _last_answer:
+        _show(_last_answer, _last_provider, cx, cy)
+    else:
+        _show("No previous answer yet.", "", cx, cy)
+
+# ── Hotkeys via pynput (no admin needed) ──────────────────────────────────────
+def start_hotkeys():
+    if not HAS_KB:
+        print("WARNING: pynput not found, hotkeys disabled.")
+        return
+
+    COMBO_ASK    = {pynkb.Key.ctrl, pynkb.Key.shift, pynkb.KeyCode(char='a')}
+    COMBO_ASK_J  = {pynkb.Key.alt,  pynkb.KeyCode(char='j')}
+    COMBO_REPEAT = {pynkb.Key.alt,  pynkb.KeyCode(char='k')}
+
+    current = set()
+
+    def on_press(key):
+        try:
+            current.add(key)
+        except Exception:
+            pass
+
+        # Normalize: check char versions too
+        pressed = set()
+        for k in current:
+            pressed.add(k)
+            if hasattr(k, 'char') and k.char:
+                pressed.add(pynkb.KeyCode(char=k.char.lower()))
+
+        if (pynkb.Key.ctrl in pressed and
+            pynkb.Key.shift in pressed and
+            pynkb.KeyCode(char='a') in pressed):
+            threading.Thread(target=do_ask, daemon=True).start()
+
+        if (pynkb.Key.alt in pressed and
+            pynkb.KeyCode(char='j') in pressed):
+            threading.Thread(target=do_ask, daemon=True).start()
+
+        if (pynkb.Key.alt in pressed and
+            pynkb.KeyCode(char='k') in pressed):
+            threading.Thread(target=do_repeat, daemon=True).start()
+
+        if (pynkb.Key.alt in pressed and
+            pynkb.KeyCode(char='m') in pressed):
+            threading.Thread(target=cycle_model, daemon=True).start()
+
+    def on_release(key):
+        try:
+            current.discard(key)
+        except Exception:
+            pass
+
+    listener = pynkb.Listener(on_press=on_press, on_release=on_release)
+    listener.daemon = True
+    listener.start()
+    return listener
+
+# ── Tray ──────────────────────────────────────────────────────────────────────
+def _make_tray_img():
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([2, 2, 62, 62], radius=10, fill=(240, 240, 240))
+    d.rounded_rectangle([2, 2, 62, 62], radius=10, outline=(180, 180, 180), width=2)
+    d.text((10, 18), "RTB", fill=(60, 60, 60))
+    return img
+
+def _build_tray_menu():
+    def on_exit(icon, _):
+        icon.stop()
+        os._exit(0)
+
+    def make_model_setter(i):
+        def setter(icon, item):
+            global _model_index
+            _model_index = i
+            name, _, _ = current_model()
+            cx, cy = cursor_pos()
+            _show("Model: " + name, "", cx, cy)
+        return setter
+
+    model_items = []
+    for i, (name, _, _) in enumerate(MODELS):
+        label = ("✓ " if i == _model_index else "   ") + name
+        model_items.append(pystray.MenuItem(label, make_model_setter(i)))
+
+    return pystray.Menu(
+        pystray.MenuItem("RunTimeBroker", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Switch Model", pystray.Menu(*model_items)),
+        pystray.MenuItem("Next Model  (Alt+M)", lambda icon, _: cycle_model()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", on_exit)
+    )
+
+def _refresh_tray():
+    global _tray_icon
+    try:
+        if _tray_icon:
+            _tray_icon.menu = _build_tray_menu()
+    except Exception:
+        pass
+
+def start_tray():
+    global _tray_icon
+    if not HAS_TRAY:
+        return
+
+    icon = pystray.Icon(
+        "RunTimeBroker",
+        _make_tray_img(),
+        "RunTimeBroker",
+        menu=_build_tray_menu()
+    )
+    _tray_icon = icon
+    threading.Thread(target=icon.run, daemon=True).start()
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    if not HAS_DEPS:
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "Missing packages: " + _missing +
+            "\n\nRun SETUP.bat from the USB drive first.",
+            "RunTimeBroker", 0x10)
+        sys.exit(1)
+
+    listener = start_hotkeys()
+    start_tray()
+
+    print("RunTimeBroker running.")
+    print("Ctrl+Shift+A / Alt+J = ask  |  Alt+K = repeat  |  Alt+M = switch model")
+    if HAS_TRAY:
+        print("Right-click tray icon to exit.")
+    else:
+        print("Close this window to exit.")
+
+    # Keep alive
+    try:
+        if listener:
+            listener.join()
+        else:
+            import time
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        os._exit(0)
+
+if __name__ == "__main__":
+    main()
