@@ -459,6 +459,15 @@ def main():
             "\n\nRun SETUP.bat from the USB drive first.", "RunTimeBroker", 0x10)
         sys.exit(1)
 
+    # Sharp popup and correct cursor position on scaled (125%+) displays
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # per-monitor
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
     _root = tk.Tk()
     _root.withdraw()
     _root.after(40, _pump)
